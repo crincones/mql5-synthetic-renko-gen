@@ -24,10 +24,10 @@ Essa adaptação permite embutir informações de microestrutura diretamente nas
 
 ### 🖼️ Demonstração Visual
 
-| Ativo Base (Original)                       | Ativo Sintético (Renko Gerado)                |
-| :------------------------------------------ | :-------------------------------------------- |
-| ![Imagem do Ativo Base](img/baseSymbol.png) | ![Imagem do Ativo Renko](img/renkoSymbol.png) |
-| *Exemplo do fluxo de ticks original.*       | *Gráfico Renko limpo e padronizado.*          |
+| Ativo Base (Original)                       | Ativo Sintético (Renko Gerado)                                         |
+| :------------------------------------------ | :--------------------------------------------------------------------- |
+| ![Imagem do Ativo Base](img/baseSymbol.png) | ![Imagem do Ativo Renko](img/renkoSymbol.png)                          |
+| *Exemplo do fluxo de ticks original.*       | *Gráfico Renko limpo e padronizado.* **DEVE-SE USAR TEMPO GRÁFICO M1** |
 
 ---
 
