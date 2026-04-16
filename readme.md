@@ -24,10 +24,10 @@ Essa adaptação permite embutir informações de microestrutura diretamente nas
 
 ### 🖼️ Demonstração Visual
 
-| Ativo Base (Original)                           | Ativo Sintético (Renko Gerado)                   |
-| :---------------------------------------------- | :----------------------------------------------- |
-| ![Imagem do Ativo Base](URL_DA_SUA_IMAGEM_AQUI) | ![Imagem do Ativo Renko](URL_DA_SUA_IMAGEM_AQUI) |
-| *Exemplo do fluxo de ticks original.*           | *Gráfico Renko limpo e padronizado.*             |
+| Ativo Base (Original)                        | Ativo Sintético (Renko Gerado)                 |
+| :------------------------------------------- | :--------------------------------------------- |
+| ![Imagem do Ativo Base](img/baseSymbol.png)) | ![Imagem do Ativo Renko](img/renkoSymbol.png)) |
+| *Exemplo do fluxo de ticks original.*        | *Gráfico Renko limpo e padronizado.*           |
 
 ---
 
@@ -55,7 +55,7 @@ O EA permite ajustes finos para se adaptar a diferentes volatilidades e necessid
 | `InpForceRebuild`     | Força a limpeza e reconstrução total do histórico.                |
 
 > **Print das Configurações:**  
-> ![Configurações de Usuário](URL_DA_SUA_IMAGEM_AQUI)
+> ![Configurações de Usuário](img/param.png)
 
 ---
 
