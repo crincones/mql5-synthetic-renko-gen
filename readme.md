@@ -1,4 +1,4 @@
-# 💹 RenkoSynthetic EA (v3.06)
+# 💹 RenkoSynthetic EA (v3.07)
 
 **Expert Advisor para MetaTrader 5 (MQL5) para geração de gráficos Renko, publicados em ativos sintéticos, para ativos BOLSA e FOREX**
 
