@@ -1,9 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                              RenkoSynthetic.mq5  |
+//|                                             RenkoSynthetic.mq5  |
 //|                         EA para geração de símbolo Renko         |
 //|                                                                  |
-//|  v3.06 — Correções de consistência no fluxo de barras ao vivo   |
-//|                                                                  |
+//|  v3.07 — Correções de consistência no fluxo de barras ao vivo   |
+//|  CORREÇÕES vs v3.07:
+//|  [C5] Inserido tamanho de tijolo R-1 para cálculo de direção e triggers
+//|
 //|  CORREÇÕES vs v3.05:                                             |
 //|                                                                  |
 //|  [C1] Separação de last_bar_close_ms e last_seen_ms             |
@@ -41,7 +43,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Carlos Rincones"
 #property link "https://github.com/crincones"
-#property version "3.06"
+#property version "3.07"
 #property strict
 
 #include <Trade\SymbolInfo.mqh>
@@ -49,11 +51,11 @@
 //+------------------------------------------------------------------+
 //| INPUTS DO USUÁRIO                                                |
 //+------------------------------------------------------------------+
-input int InpRenkoSizeTicks = 20;    // Tamanho da barra Renko (ticks)
-input int InpHistoryDays = 30;       // Dias de histórico a processar
+input int InpRenkoSizeTicks = 11;    // Tamanho da barra Renko (ticks)
+input int InpHistoryDays = 5;        // Dias de histórico a processar
 input int InpUpdateIntervalMs = 500; // Intervalo de atualização (ms)
 input string InpTemplate = "";       // Template para o gráfico Renko
-input bool InpForceRebuild = false;  // Forçar reconstrução total do histórico
+input bool InpForceRebuild = true;   // Forçar reconstrução total do histórico
 
 //+------------------------------------------------------------------+
 //| CONSTANTES E ENUMERAÇÕES                                         |
@@ -87,8 +89,10 @@ struct EAContext
 {
     string base_symbol;
     string renko_symbol;
-    double renko_size;
+    double renko_size;      // N × point_size  (valor bruto do input)
+    double real_renko_size; // (N - 1) × point_size  (tamanho real do tijolo)
     double point_size;
+    double tick_size; // menor variação do ativo
     int digits;
     ENUM_ASSET_TYPE asset_type;
     uint flag_type;
@@ -97,9 +101,8 @@ struct EAContext
     double last_open;
     int last_direction;
 
-    // [C1] — dois contadores com responsabilidades distintas
-    long last_bar_close_ms; // ms do tick que fechou a última barra → âncora do CopyTicksRange
-    long last_seen_ms;      // ms do último tick processado → filtro anti-double-count
+    long last_bar_close_ms;
+    long last_seen_ms;
 
     RenkoBarState current_bar;
 
@@ -176,12 +179,24 @@ int OnInit()
     Print("Tipo detectado : ", (g_ctx.asset_type == ASSET_FOREX) ? "FOREX" : "BOLSA");
 
     g_ctx.digits = (int)SymbolInfoInteger(g_ctx.base_symbol, SYMBOL_DIGITS);
-    g_ctx.point_size = SymbolInfoDouble(g_ctx.base_symbol, SYMBOL_POINT);
-    g_ctx.renko_size = InpRenkoSizeTicks * g_ctx.point_size;
 
-    Print("Digits         : ", g_ctx.digits);
-    Print("Point          : ", g_ctx.point_size);
-    Print("Renko size ($) : ", DoubleToString(g_ctx.renko_size, g_ctx.digits));
+    g_ctx.point_size = SymbolInfoDouble(g_ctx.base_symbol, SYMBOL_POINT);
+    g_ctx.tick_size = SymbolInfoDouble(g_ctx.base_symbol, SYMBOL_TRADE_TICK_SIZE);
+    if (g_ctx.tick_size <= 0)
+        g_ctx.tick_size = g_ctx.point_size; // fallback seguro
+
+    g_ctx.renko_size = InpRenkoSizeTicks * g_ctx.tick_size;            // 50 × 5 = 250
+    g_ctx.real_renko_size = (InpRenkoSizeTicks - 1) * g_ctx.tick_size; // 49 × 5 = 245
+
+    g_ctx.real_renko_size =
+        NormalizeDouble(g_ctx.real_renko_size, g_ctx.digits);
+
+    g_ctx.renko_size =
+        NormalizeDouble(g_ctx.renko_size, g_ctx.digits);
+
+    Print("Tick size      : ", g_ctx.tick_size);
+    Print("Renko size     : ", DoubleToString(g_ctx.renko_size, g_ctx.digits));
+    Print("Real renko size: ", DoubleToString(g_ctx.real_renko_size, g_ctx.digits));
 
     if (!EnsureSyntheticSymbolExists())
     {
@@ -389,7 +404,7 @@ void LoadGlobalVars()
     if (GlobalVariableCheck(GV_BAR_SIZE))
     {
         double saved_size = GlobalVariableGet(GV_BAR_SIZE);
-        if (MathAbs(saved_size - g_ctx.renko_size) > g_ctx.point_size * 0.5)
+        if (MathAbs(saved_size - g_ctx.renko_size) > g_ctx.tick_size * 0.5)
         {
             Print("Tamanho de barra mudou. Forçando reconstrução.");
             ResetGlobalVars();
@@ -538,7 +553,7 @@ bool CheckHistoryIntegrity()
         return false;
     }
 
-    double tol = g_ctx.point_size * 0.5;
+    double tol = g_ctx.tick_size * 0.5;
     for (int i = 0; i < count - 1; i++)
     {
         int dir_curr = (rates[i].close > rates[i].open) ? 1 : -1;
@@ -563,7 +578,7 @@ bool CheckHistoryIntegrity()
     }
 
     double renko_last_close = rates[count - 1].close;
-    if (MathAbs(renko_last_close - g_ctx.last_close) > g_ctx.point_size * 0.5)
+    if (MathAbs(renko_last_close - g_ctx.last_close) > g_ctx.tick_size * 0.5)
     {
         Print("Integridade: divergência no último close.",
               " GV=", g_ctx.last_close, " Renko=", renko_last_close);
@@ -689,7 +704,7 @@ void InjectSyntheticTickIfGap()
     synthetic.time = TimeCurrent();
     synthetic.time_msc = (long)TimeCurrent() * 1000;
     synthetic.bid = ref_price;
-    synthetic.ask = ref_price + g_ctx.point_size;
+    synthetic.ask = ref_price + g_ctx.tick_size;
     synthetic.last = ref_price;
     synthetic.volume = 0;
     synthetic.flags = (g_ctx.asset_type == ASSET_FOREX) ? TICK_FLAG_BID : TICK_FLAG_LAST;
@@ -754,6 +769,11 @@ void EstimateAggression(const MqlTick &tick, long &buy_vol, long &sell_vol)
     }
 }
 
+double NormalizeToTick(double price)
+{
+    return MathRound(price / g_ctx.tick_size) * g_ctx.tick_size;
+}
+
 //+------------------------------------------------------------------+
 //| ProcessTick v3.06                                                |
 //|                                                                  |
@@ -787,11 +807,6 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
 
     // ------------------------------------------------------------------
     // [C1] Filtro anti-double-count.
-    // Durante o rebuild não existe last_seen_ms significativo (é 0),
-    // então ticks históricos passam normalmente.
-    // Durante operação ao vivo, ticks entre last_bar_close_ms e
-    // last_seen_ms são re-entregues pelo CopyTicksRange mas devem
-    // ser ignorados — suas agressões já estão em current_bar.
     // ------------------------------------------------------------------
     if (tick_ms <= g_ctx.last_seen_ms)
         return;
@@ -805,21 +820,17 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
         g_ctx.last_open = g_ctx.last_close;
         g_ctx.last_direction = 0;
 
-        // [C2][C3] open_time_ms definido aqui, antes de qualquer acumulação
         InitCurrentBar(g_ctx.last_close, tick_ms);
 
         if (g_next_bar_time == 0)
             g_next_bar_time = (datetime)(tick_ms / 1000);
 
-        // Atualiza last_seen_ms mesmo no tick de inicialização
         g_ctx.last_seen_ms = tick_ms;
         return;
     }
 
     // ------------------------------------------------------------------
-    // [C2][C3] Se a barra em formação ainda não tem open_time_ms
-    // (sentinela = 0), este é o primeiro tick real dela.
-    // Define open_time_ms ANTES de acumular agressão.
+    // [C2][C3] Primeiro tick real da barra — define open_time_ms.
     // ------------------------------------------------------------------
     if (g_ctx.current_bar.open_time_ms == 0)
     {
@@ -830,7 +841,7 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
     }
 
     // ------------------------------------------------------------------
-    // Acumula agressão APÓS garantir que open_time_ms está definido [C3]
+    // Acumula agressão APÓS open_time_ms estar definido [C3]
     // ------------------------------------------------------------------
     long buy_vol = 0, sell_vol = 0;
     EstimateAggression(tick, buy_vol, sell_vol);
@@ -838,14 +849,12 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
     g_ctx.current_bar.sell_aggression += sell_vol;
 
     // ------------------------------------------------------------------
-    // LOOP PRINCIPAL — consome todo o deslocamento de preço.
-    //
-    // A agressão é creditada na barra que fecha e os contadores são
-    // zerados em InitCurrentBarFromClose para a próxima barra.
+    // LOOP PRINCIPAL
+    // Trigger usa real_renko_size = (N-1) × tick  [fórmula do livro]
+    // Close  usa real_renko_size — tijolo fecha no nível correspondente
     // ------------------------------------------------------------------
     while (true)
     {
-        // Atualiza wicks com o preço atual
         if (price > g_ctx.current_bar.high_price)
             g_ctx.current_bar.high_price = price;
         if (price < g_ctx.current_bar.low_price)
@@ -854,6 +863,7 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
         double anchor_up = (g_ctx.last_direction == -1) ? g_ctx.last_open : g_ctx.last_close;
         double anchor_dn = (g_ctx.last_direction == 1) ? g_ctx.last_open : g_ctx.last_close;
 
+        // Fórmula: dispara quando preço atinge (N-1) ticks acima/abaixo da âncora
         bool trigger_up = (price >= anchor_up + g_ctx.renko_size);
         bool trigger_dn = (price <= anchor_dn - g_ctx.renko_size);
 
@@ -867,12 +877,13 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
         if (trigger_up)
         {
             double bar_open = (g_ctx.last_direction == -1) ? g_ctx.last_open : g_ctx.last_close;
-            double bar_close = bar_open + g_ctx.renko_size;
+            double bar_close =
+                NormalizeToTick(bar_open + g_ctx.real_renko_size);
 
             bar.open = bar_open;
             bar.close = bar_close;
-            bar.high = bar_close;                                     // HIGH nunca passa do close em barra de alta
-            bar.low = MathMin(bar_open, g_ctx.current_bar.low_price); // wick inferior
+            bar.high = bar_close;
+            bar.low = MathMin(bar_open, g_ctx.current_bar.low_price);
             if (bar.low > bar_open)
                 bar.low = bar_open;
             if (bar.high < bar_close)
@@ -881,7 +892,6 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
             bar.tick_volume = g_ctx.current_bar.buy_aggression;
             bar.real_volume = g_ctx.current_bar.sell_aggression;
 
-            // Duração: do primeiro tick real da barra até o tick que a fechou [C2]
             long open_ms = (g_ctx.current_bar.open_time_ms > 0)
                                ? g_ctx.current_bar.open_time_ms
                                : tick_ms;
@@ -892,10 +902,8 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
             g_ctx.last_open = bar_open;
             g_ctx.last_close = bar_close;
             g_ctx.last_direction = 1;
-            g_ctx.last_bar_close_ms = tick_ms; // [C1] âncora avança apenas ao fechar
+            g_ctx.last_bar_close_ms = tick_ms;
 
-            // [C2] Próxima barra começa sem open_time_ms — será definido
-            // pelo primeiro tick real que ela receber.
             InitCurrentBarFromClose(g_ctx.last_close);
             continue;
         }
@@ -903,12 +911,13 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
         if (trigger_dn)
         {
             double bar_open = (g_ctx.last_direction == 1) ? g_ctx.last_open : g_ctx.last_close;
-            double bar_close = bar_open - g_ctx.renko_size;
+            double bar_close =
+                NormalizeToTick(bar_open - g_ctx.real_renko_size);
 
             bar.open = bar_open;
             bar.close = bar_close;
-            bar.low = bar_close;                                        // LOW nunca passa do close em barra de baixa
-            bar.high = MathMax(bar_open, g_ctx.current_bar.high_price); // wick superior
+            bar.low = bar_close;
+            bar.high = MathMax(bar_open, g_ctx.current_bar.high_price);
             if (bar.high < bar_open)
                 bar.high = bar_open;
             if (bar.low > bar_close)
@@ -917,7 +926,6 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
             bar.tick_volume = g_ctx.current_bar.buy_aggression;
             bar.real_volume = g_ctx.current_bar.sell_aggression;
 
-            // Duração: do primeiro tick real da barra até o tick que a fechou [C2]
             long open_ms = (g_ctx.current_bar.open_time_ms > 0)
                                ? g_ctx.current_bar.open_time_ms
                                : tick_ms;
@@ -928,9 +936,8 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
             g_ctx.last_open = bar_open;
             g_ctx.last_close = bar_close;
             g_ctx.last_direction = -1;
-            g_ctx.last_bar_close_ms = tick_ms; // [C1] âncora avança apenas ao fechar
+            g_ctx.last_bar_close_ms = tick_ms;
 
-            // [C2] Próxima barra começa sem open_time_ms
             InitCurrentBarFromClose(g_ctx.last_close);
             continue;
         }
@@ -938,7 +945,7 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
     } // fim while
 
     // ------------------------------------------------------------------
-    // [C1] Atualiza last_seen_ms ao final — após processar o tick.
+    // [C1] Atualiza last_seen_ms ao final.
     // ------------------------------------------------------------------
     if (tick_ms > g_ctx.last_seen_ms)
         g_ctx.last_seen_ms = tick_ms;
@@ -1026,8 +1033,11 @@ void CommitRenkoBar(MqlRates &bar, int &counter)
 
 double AlignToGrid(double price)
 {
-    double size = g_ctx.renko_size;
-    return MathRound(price / size) * size;
+    double aligned =
+        MathRound(price / g_ctx.real_renko_size) *
+        g_ctx.real_renko_size;
+
+    return NormalizeToTick(aligned);
 }
 
 //==================================================================//
