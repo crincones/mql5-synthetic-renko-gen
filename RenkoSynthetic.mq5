@@ -2,6 +2,7 @@
 //|                                             RenkoSynthetic.mq5  |
 //|                         EA para geração de símbolo Renko         |
 //|                                                                  |
+//|  v3.08 — Correções de Renko R-1 e Precisão de Agressão          |
 //|  v3.07 — Correções de consistência no fluxo de barras ao vivo   |
 //|  CORREÇÕES vs v3.07:
 //|  [C5] Inserido tamanho de tijolo R-1 para cálculo de direção e triggers
@@ -43,7 +44,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Carlos Rincones"
 #property link "https://github.com/crincones"
-#property version "3.07"
+#property version "3.08"
 #property strict
 
 #include <Trade\SymbolInfo.mqh>
@@ -51,11 +52,13 @@
 //+------------------------------------------------------------------+
 //| INPUTS DO USUÁRIO                                                |
 //+------------------------------------------------------------------+
-input int InpRenkoSizeTicks = 11;    // Tamanho da barra Renko (ticks)
-input int InpHistoryDays = 5;        // Dias de histórico a processar
-input int InpUpdateIntervalMs = 500; // Intervalo de atualização (ms)
-input string InpTemplate = "";       // Template para o gráfico Renko
-input bool InpForceRebuild = true;   // Forçar reconstrução total do histórico
+input int InpRenkoSizeTicks = 11;      // Tamanho da barra Renko (ticks)
+input int InpHistoryDays = 5;          // Dias de histórico a processar
+input int InpUpdateIntervalMs = 500;   // Intervalo de atualização (ms)
+input string InpTemplate = "";         // Template para o gráfico Renko
+input bool InpForceRebuild = true;     // Forçar reconstrução total do histórico
+input bool UsarLimiarAgressao = false; // Usar limiar de agressão para filtrar ticks
+input int LimiarAgressao = 0;          // Abaixo disto é considerado Agressão (0 desativa)
 
 //+------------------------------------------------------------------+
 //| CONSTANTES E ENUMERAÇÕES                                         |
@@ -738,8 +741,15 @@ void EstimateAggression(const MqlTick &tick, long &buy_vol, long &sell_vol)
 
     if (g_ctx.asset_type == ASSET_EXCHANGE)
     {
-        bool is_buy = (tick.flags & TICK_FLAG_BUY) != 0;
-        bool is_sell = (tick.flags & TICK_FLAG_SELL) != 0;
+        bool condicaoLimiar = true;
+        if (UsarLimiarAgressao)
+        {
+            condicaoLimiar = vol < LimiarAgressao;
+        }
+
+        bool is_buy = ((tick.flags & TICK_FLAG_BUY) == TICK_FLAG_BUY) && (condicaoLimiar);
+        bool is_sell = ((tick.flags & TICK_FLAG_SELL) == TICK_FLAG_SELL) && (condicaoLimiar);
+
         if (is_buy && !is_sell)
             buy_vol = vol;
         if (is_sell && !is_buy)
