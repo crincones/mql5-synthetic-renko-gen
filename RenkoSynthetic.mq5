@@ -2,8 +2,31 @@
 //|                                             RenkoSynthetic.mq5  |
 //|                         EA para geração de símbolo Renko         |
 //|                                                                  |
+//|  v3.11 — Corte de pregão e brick em formação no gráfico         |
 //|  v3.08 — Correções de Renko R-1 e Precisão de Agressão          |
 //|  v3.07 — Correções de consistência no fluxo de barras ao vivo   |
+//|                                                                  |
+//|  MUDANÇAS vs v3.08:                                              |
+//|                                                                  |
+//|  [R4] Corte de pregão (InpResetDiario). Na virada do dia (hora   |
+//|       do servidor, extraída do timestamp do tick) o brick em     |
+//|       formação é descartado e a grade reancora no primeiro preço |
+//|       do dia novo, como no começo da série. Sem isso o gap       |
+//|       noturno fica escondido dentro de um brick e a sequência    |
+//|       cola dois pregões num só. CheckHistoryIntegrity aceita a   |
+//|       descontinuidade de preço na virada de dia e RebuildHistory |
+//|       começa a varredura no início de um dia. Com o input        |
+//|       desligado o gráfico é idêntico ao da v3.08.                |
+//|                                                                  |
+//|  [P1] Brick em formação como barra provisória                    |
+//|       (InpShowFormingBrick). O brick que ainda não fechou é      |
+//|       escrito no próprio símbolo sintético, no slot do próximo   |
+//|       timestamp, para o MT5 desenhá-lo com o estilo de candle do |
+//|       gráfico. Ela não consome timestamp nem altera o estado do  |
+//|       gerador; é apagada antes de toda verificação de            |
+//|       integridade e no OnDeinit, e seu timestamp fica numa       |
+//|       Global Variable para que um restart saiba apagá-la.        |
+//|                                                                  |
 //|  CORREÇÕES vs v3.07:
 //|  [C5] Inserido tamanho de tijolo R-1 para cálculo de direção e triggers
 //|
@@ -44,7 +67,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Carlos Rincones"
 #property link "https://github.com/crincones"
-#property version "3.08"
+#property version "3.11"
 #property strict
 
 #include <Trade\SymbolInfo.mqh>
@@ -57,8 +80,10 @@ input int InpHistoryDays = 5;          // Dias de histórico a processar
 input int InpUpdateIntervalMs = 500;   // Intervalo de atualização (ms)
 input string InpTemplate = "";         // Template para o gráfico Renko
 input bool InpForceRebuild = true;     // Forçar reconstrução total do histórico
+input bool InpResetDiario = true;      // Reancorar a grade a cada dia novo [R4]
 input bool UsarLimiarAgressao = false; // Usar limiar de agressão para filtrar ticks
 input int LimiarAgressao = 0;          // Abaixo disto é considerado Agressão (0 desativa)
+input bool InpShowFormingBrick = true; // Desenhar o brick em formação como barra provisória [P1]
 
 //+------------------------------------------------------------------+
 //| CONSTANTES E ENUMERAÇÕES                                         |
@@ -139,6 +164,17 @@ string GV_CUR_BUY = "";
 string GV_CUR_SELL = "";
 
 string GV_CHART_INIT_UPDATED = "";
+string GV_PROV_TIME = ""; // [P1] timestamp da barra provisória
+
+// ---- Estado auxiliar ----------------------------------------------
+double g_cur_last_price = 0; // [P1] último preço visto (close da provisória)
+double g_prev_bid = 0;       // agressão FOREX: mid-price anterior
+double g_prev_ask = 0;       //   (era static; agora zera no corte de pregão)
+
+// ---- Barra provisória (brick em formação) [P1] --------------------
+long g_prov_ts = 0;           // timestamp da provisória no gráfico (0 = nenhuma)
+MqlRates g_prov_bar;          // última provisória escrita, evita reescrita inútil
+datetime g_first_commit = 0;  // 1ª barra real gravada no ciclo do timer
 
 #define OBJ_STATUS_TYPE "RenkoStatus_Type"
 #define OBJ_STATUS_INTEG "RenkoStatus_Integrity"
@@ -172,7 +208,11 @@ int OnInit()
     GV_CHART_INIT_UPDATED = g_ctx.renko_symbol + "_init_updated";
     GlobalVariableSet(GV_CHART_INIT_UPDATED, (double)0.0); // Valor para ser lido por indicadores externos para alertas
 
-    Print("=== RenkoSynthetic EA v3.06 iniciando ===");
+    GV_PROV_TIME = g_ctx.renko_symbol + "_prov_time"; // [P1]
+    ZeroMemory(g_prov_bar);
+    g_prov_ts = GlobalVariableCheck(GV_PROV_TIME) ? (long)GlobalVariableGet(GV_PROV_TIME) : 0;
+
+    Print("=== RenkoSynthetic EA v3.11 iniciando ===");
     Print("Símbolo base   : ", g_ctx.base_symbol);
     Print("Símbolo Renko  : ", g_ctx.renko_symbol);
     Print("Tamanho Renko  : ", InpRenkoSizeTicks, " ticks");
@@ -200,6 +240,9 @@ int OnInit()
     Print("Tick size      : ", g_ctx.tick_size);
     Print("Renko size     : ", DoubleToString(g_ctx.renko_size, g_ctx.digits));
     Print("Real renko size: ", DoubleToString(g_ctx.real_renko_size, g_ctx.digits));
+    Print("Corte de pregão: ", InpResetDiario
+              ? "a grade reancora a cada dia novo [R4]"
+              : "nenhum — a grade e o brick em formação atravessam a noite");
 
     if (!EnsureSyntheticSymbolExists())
     {
@@ -207,6 +250,11 @@ int OnInit()
         DrawStatusText(false);
         return INIT_FAILED;
     }
+
+    // [P1] A provisória deixada pela sessão anterior é só renderização:
+    // apaga ANTES de verificar a integridade, que deve ver apenas
+    // barras fechadas.
+    RemoveProvisionalBar();
 
     LoadGlobalVars();
 
@@ -243,6 +291,8 @@ int OnInit()
         RestoreCurrentBarFromGV();
     }
 
+    RefreshProvisionalBar(); // [P1] só depois de o histórico estar íntegro
+
     DrawStatusText(g_ctx.integrity_ok);
     EventSetMillisecondTimer(InpUpdateIntervalMs);
 
@@ -263,6 +313,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
     EventKillTimer();
+    RemoveProvisionalBar(); // [P1] deixa o gráfico só com barras fechadas
     ObjectDelete(0, OBJ_STATUS_TYPE);
     ObjectDelete(0, OBJ_STATUS_INTEG);
     Print("RenkoSynthetic EA encerrado. Motivo: ", reason);
@@ -280,6 +331,7 @@ void OnTimer()
     if (now - g_last_reconnect > 30 && !g_ctx.integrity_ok)
     {
         g_last_reconnect = now;
+        RemoveProvisionalBar(); // [P1] a checagem só pode ver barras fechadas
         if (CheckHistoryIntegrity())
         {
             g_ctx.integrity_ok = true;
@@ -395,7 +447,108 @@ void CopySymbolProperties()
 void ClearSyntheticHistory()
 {
     CustomRatesDelete(g_ctx.renko_symbol, 0, TimeCurrent() + 86400);
+
+    // [P1] a provisória foi apagada junto — esquece o ponteiro para não
+    // apagar depois um slot reaproveitado por uma barra da reconstrução.
+    g_prov_ts = 0;
+    ZeroMemory(g_prov_bar);
+    GlobalVariableSet(GV_PROV_TIME, 0.0);
+
     Print("Histórico do símbolo sintético apagado.");
+}
+
+//==================================================================//
+//                BARRA PROVISÓRIA (BRICK EM FORMAÇÃO) [P1]         //
+//==================================================================//
+
+//+------------------------------------------------------------------+
+//| RemoveProvisionalBar                                             |
+//|                                                                  |
+//| Idempotente. Depois desta chamada o símbolo sintético contém     |
+//| exclusivamente barras fechadas.                                  |
+//+------------------------------------------------------------------+
+void RemoveProvisionalBar()
+{
+    if (g_prov_ts <= 0)
+        return;
+
+    datetime ts = (datetime)g_prov_ts;
+    CustomRatesDelete(g_ctx.renko_symbol, ts, ts);
+
+    g_prov_ts = 0;
+    ZeroMemory(g_prov_bar);
+    GlobalVariableSet(GV_PROV_TIME, 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| RefreshProvisionalBar                                            |
+//|                                                                  |
+//| Escreve o brick em formação no slot g_next_bar_time — o mesmo    |
+//| que AllocBarTimestamp usaria se o brick fechasse agora. Assim    |
+//| ela fica sempre depois da última barra fechada e nunca colide    |
+//| com uma barra existente. Não consome o timestamp.                |
+//|                                                                  |
+//| Não reescreve quando nada mudou: reescrever no mesmo slot é      |
+//| barato, mas trocar de slot força recálculo dos indicadores.      |
+//+------------------------------------------------------------------+
+void RefreshProvisionalBar()
+{
+    if (!InpShowFormingBrick || g_ctx.last_close <= 0 || g_next_bar_time <= 0)
+    {
+        RemoveProvisionalBar();
+        return;
+    }
+
+    datetime ts = g_next_bar_time;
+
+    double open_p = g_ctx.current_bar.open_price;
+    if (open_p <= 0)
+        open_p = g_ctx.last_close;
+
+    double close_p = (g_cur_last_price > 0) ? g_cur_last_price : open_p;
+
+    double hi = g_ctx.current_bar.high_price;
+    double lo = g_ctx.current_bar.low_price;
+    if (hi <= 0)
+        hi = MathMax(open_p, close_p);
+    if (lo <= 0)
+        lo = MathMin(open_p, close_p);
+
+    MqlRates bar;
+    ZeroMemory(bar);
+    bar.time = ts;
+    bar.open = open_p;
+    bar.close = close_p;
+    bar.high = MathMax(hi, MathMax(open_p, close_p));
+    bar.low = MathMin(lo, MathMin(open_p, close_p));
+    bar.tick_volume = g_ctx.current_bar.buy_aggression; // mesma convenção das barras fechadas
+    bar.real_volume = g_ctx.current_bar.sell_aggression;
+    bar.spread = 0;
+
+    //--- nada mudou desde a última escrita?
+    if (g_prov_ts == (long)ts &&
+        g_prov_bar.open == bar.open && g_prov_bar.close == bar.close &&
+        g_prov_bar.high == bar.high && g_prov_bar.low == bar.low &&
+        g_prov_bar.tick_volume == bar.tick_volume &&
+        g_prov_bar.real_volume == bar.real_volume)
+        return;
+
+    //--- mudou de slot: apaga o slot antigo antes de ocupar o novo
+    if (g_prov_ts > 0 && g_prov_ts != (long)ts)
+        RemoveProvisionalBar();
+
+    MqlRates arr[1];
+    arr[0] = bar;
+    if (CustomRatesUpdate(g_ctx.renko_symbol, arr) < 0)
+    {
+        Print("[P1] Erro ao escrever barra provisória: ", GetLastError(),
+              " | time=", TimeToString(ts, TIME_DATE | TIME_SECONDS));
+        return;
+    }
+
+    g_prov_bar = bar;
+    g_prov_ts = (long)ts;
+    GlobalVariableSet(GV_PROV_TIME, (double)g_prov_ts);
 }
 
 //==================================================================//
@@ -485,6 +638,7 @@ void RestoreCurrentBarFromGV()
             g_ctx.current_bar.sell_aggression = (long)GlobalVariableGet(GV_CUR_SELL);
             g_ctx.current_bar.start_ms = saved_ms;
             g_ctx.current_bar.last_tick_ms = saved_ms;
+            g_cur_last_price = g_ctx.current_bar.open_price; // [P1]
 
             Print("Barra em formação restaurada: open=", DoubleToString(g_ctx.current_bar.open_price, g_ctx.digits),
                   " H=", DoubleToString(g_ctx.current_bar.high_price, g_ctx.digits),
@@ -521,6 +675,9 @@ void ResetGlobalVars()
     g_ctx.last_seen_ms = 0;      // [C1]
     g_ctx.last_direction = 0;
     g_next_bar_time = 0;
+    g_cur_last_price = 0;
+    g_prev_bid = 0;
+    g_prev_ask = 0;
 }
 
 void ResetRenkoState()
@@ -559,11 +716,19 @@ bool CheckHistoryIntegrity()
     double tol = g_ctx.tick_size * 0.5;
     for (int i = 0; i < count - 1; i++)
     {
+        //--- [R4] na virada de pregão a grade reancora: a descontinuidade
+        //--- entre o último brick de um dia e o primeiro do seguinte é
+        //--- legítima. Sem esta exceção o corte diário forçaria
+        //--- reconstrução total a cada restart do EA.
+        bool virou_dia = (InpResetDiario &&
+                          DiaDoTick((long)rates[i].time * 1000) !=
+                              DiaDoTick((long)rates[i + 1].time * 1000));
+
         int dir_curr = (rates[i].close > rates[i].open) ? 1 : -1;
         int dir_next = (rates[i + 1].close > rates[i + 1].open) ? 1 : -1;
         double expected_open = (dir_curr == dir_next) ? rates[i].close : rates[i].open;
         double diff = MathAbs(rates[i + 1].open - expected_open);
-        if (diff > tol)
+        if (diff > tol && !virou_dia)
         {
             Print("Integridade: gap de preço na barra ", i,
                   " expected_open=", DoubleToString(expected_open, g_ctx.digits),
@@ -601,6 +766,12 @@ bool RebuildHistory()
     Print("Iniciando reconstrução do histórico Renko...");
 
     datetime date_from = TimeCurrent() - (datetime)(InpHistoryDays * 86400);
+
+    //--- [R4] começa a varredura na virada de dia: com a grade
+    //--- reancorando por pregão, um primeiro dia truncado reancoraria
+    //--- num preço do meio da sessão. Custo: até um dia a mais de ticks.
+    if (InpResetDiario)
+        date_from = (datetime)(((long)date_from / 86400) * 86400);
     datetime date_to = TimeCurrent();
 
     MqlTick ticks[];
@@ -626,6 +797,9 @@ bool RebuildHistory()
     g_ctx.last_bar_close_ms = 0; // [C1]
     g_ctx.last_seen_ms = 0;      // [C1]
     g_next_bar_time = 0;
+    g_cur_last_price = 0;
+    g_prev_bid = 0;
+    g_prev_ask = 0;
     ZeroMemory(g_ctx.current_bar);
 
     int bars_created = 0;
@@ -666,6 +840,8 @@ void UpdateRenkoIncremental()
 
     int bars_created = 0;
 
+    g_first_commit = 0; // [P1] registra onde cai a 1ª barra fechada do ciclo
+
     if (tick_count > 0)
     {
         for (int i = 0; i < tick_count; i++)
@@ -676,11 +852,32 @@ void UpdateRenkoIncremental()
         InjectSyntheticTickIfGap();
     }
 
+    // [P1] Reconcilia a provisória com as barras fechadas neste ciclo.
+    // Se a primeira caiu exatamente no slot da provisória, já a
+    // sobrescreveu — apagar aquele timestamp destruiria uma barra real.
+    // Só sobra provisória órfã quando a barra fechada pegou um slot
+    // POSTERIOR ao dela.
+    if (g_prov_ts > 0 && g_first_commit > 0)
+    {
+        if (g_first_commit == (datetime)g_prov_ts)
+        {
+            g_prov_ts = 0; // o slot agora pertence a uma barra fechada
+            ZeroMemory(g_prov_bar);
+            GlobalVariableSet(GV_PROV_TIME, 0.0);
+        }
+        else
+        {
+            RemoveProvisionalBar();
+        }
+    }
+
     // [C4] Ponto único de saída — sempre salva, independente do resultado.
     SaveGlobalVars();
 
     if (bars_created > 0)
         TryOpenRenkoChart();
+
+    RefreshProvisionalBar(); // [P1] redesenha o brick em formação
 }
 
 void InjectSyntheticTickIfGap()
@@ -757,13 +954,12 @@ void EstimateAggression(const MqlTick &tick, long &buy_vol, long &sell_vol)
     }
     else
     {
-        static double prev_bid = 0, prev_ask = 0;
-        if (prev_bid == 0)
+        if (g_prev_bid == 0)
         {
-            prev_bid = tick.bid;
-            prev_ask = tick.ask;
+            g_prev_bid = tick.bid;
+            g_prev_ask = tick.ask;
         }
-        double mid_prev = (prev_bid + prev_ask) / 2.0;
+        double mid_prev = (g_prev_bid + g_prev_ask) / 2.0;
         double mid_curr = (tick.bid + tick.ask) / 2.0;
         if (mid_curr > mid_prev)
             buy_vol = vol;
@@ -774,9 +970,42 @@ void EstimateAggression(const MqlTick &tick, long &buy_vol, long &sell_vol)
             buy_vol = vol / 2;
             sell_vol = vol - buy_vol;
         }
-        prev_bid = tick.bid;
-        prev_ask = tick.ask;
+        g_prev_bid = tick.bid;
+        g_prev_ask = tick.ask;
     }
+}
+
+//+------------------------------------------------------------------+
+//| DiaDoTick — o pregão a que um instante pertence [R4]             |
+//|                                                                  |
+//| Número do dia na hora do SERVIDOR, função pura do timestamp do   |
+//| tick e nunca de TimeCurrent(): um corte pelo relógio dispararia  |
+//| ao vivo mas nunca na reconstrução, onde só existem ticks, e os   |
+//| dois caminhos produziriam gráficos diferentes.                   |
+//+------------------------------------------------------------------+
+long DiaDoTick(const long tick_ms)
+{
+    return (tick_ms / 1000) / 86400;
+}
+
+//+------------------------------------------------------------------+
+//| ResetDia — virada de pregão [R4]                                 |
+//|                                                                  |
+//| Zerar last_close faz o próximo tick cair no ramo de              |
+//| inicialização do ProcessTick, que reancora a grade em            |
+//| AlignToGrid(primeiro preço do dia), como no começo da série. Não |
+//| há brick parcial a emitir: o que estava acumulado no brick em    |
+//| formação é descartado, como sempre foram os ticks anteriores ao  |
+//| primeiro brick. g_next_bar_time e last_bar_close_ms são mantidos.|
+//+------------------------------------------------------------------+
+void ResetDia()
+{
+    g_ctx.last_close = 0;
+    g_ctx.last_open = 0;
+    g_ctx.last_direction = 0;
+    g_prev_bid = 0;
+    g_prev_ask = 0;
+    ZeroMemory(g_ctx.current_bar);
 }
 
 double NormalizeToTick(double price)
@@ -820,6 +1049,16 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
     // ------------------------------------------------------------------
     if (tick_ms <= g_ctx.last_seen_ms)
         return;
+
+    // ------------------------------------------------------------------
+    // [R4] Virada de pregão: o brick em formação não atravessa a noite
+    // e a grade reancora no primeiro preço do dia novo.
+    // ------------------------------------------------------------------
+    if (InpResetDiario && g_ctx.last_seen_ms > 0 &&
+        DiaDoTick(tick_ms) != DiaDoTick(g_ctx.last_seen_ms))
+        ResetDia();
+
+    g_cur_last_price = price; // [P1]
 
     // ------------------------------------------------------------------
     // Inicialização: primeiro tick de toda a sessão define nível base.
@@ -1034,7 +1273,11 @@ void CommitRenkoBar(MqlRates &bar, int &counter)
               " L=", DoubleToString(bar.low, g_ctx.digits),
               " C=", DoubleToString(bar.close, g_ctx.digits));
     else
+    {
         counter++;
+        if (g_first_commit == 0)
+            g_first_commit = bar.time; // [P1]
+    }
 }
 
 //==================================================================//
