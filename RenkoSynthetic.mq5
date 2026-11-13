@@ -2,9 +2,30 @@
 //|                                             RenkoSynthetic.mq5  |
 //|                         EA para geração de símbolo Renko         |
 //|                                                                  |
+//|  v3.12 — Configuração por ativo e reconstrução mais leve        |
 //|  v3.11 — Corte de pregão e brick em formação no gráfico         |
 //|  v3.08 — Correções de Renko R-1 e Precisão de Agressão          |
 //|  v3.07 — Correções de consistência no fluxo de barras ao vivo   |
+//|                                                                  |
+//|  MUDANÇAS vs v3.11:                                              |
+//|                                                                  |
+//|  [G1] Configuração por ativo (InpConfigModo). A última           |
+//|       configuração usada em cada ativo base é gravada em         |
+//|       MQL5\Files\RenkoSynthetic\<ativo>.cfg e reaplicada quando  |
+//|       o EA volta a ser colocado no mesmo ativo. Um EA não altera |
+//|       os próprios inputs, então o código usa g_set (configuração |
+//|       efetiva): input diferente do padrão vale; input no padrão  |
+//|       cede ao valor salvo. O log e uma linha de status no        |
+//|       gráfico dizem o que veio do arquivo.                       |
+//|                                                                  |
+//|  [M1] RebuildHistory lê um dia de ticks por vez em vez de todos  |
+//|       os InpHistoryDays de uma só vez: o pico de memória cai     |
+//|       para o de um único pregão. Mesmos ticks, mesma ordem.      |
+//|                                                                  |
+//|  [M2] UpdateRenkoIncremental busca ticks a partir do último tick |
+//|       visto (last_seen_ms) em vez do fechamento da última barra. |
+//|       O filtro [C1] já descartava o que vinha antes, então o     |
+//|       gráfico é idêntico e cada ciclo copia muito menos ticks.   |
 //|                                                                  |
 //|  MUDANÇAS vs v3.08:                                              |
 //|                                                                  |
@@ -67,23 +88,231 @@
 //+------------------------------------------------------------------+
 #property copyright "Carlos Rincones"
 #property link "https://github.com/crincones"
-#property version "3.11"
+#property version "3.12"
 #property strict
 
 #include <Trade\SymbolInfo.mqh>
 
+//--- Padrões COMPILADOS dos inputs. O modo Automático de InpConfigModo
+//--- compara cada input com estes valores para saber se o usuário
+//--- mexeu nele (ver "CONFIGURAÇÃO POR ATIVO"). [G1]
+#define DEF_RENKO_TICKS 11
+#define DEF_DIAS_HISTORICO 5
+#define DEF_INTERVALO_MS 500
+#define DEF_TEMPLATE ""
+#define DEF_FORCAR_RECONSTRUCAO true
+#define DEF_RESET_DIARIO true
+#define DEF_USAR_LIMIAR_AGRESSAO false
+#define DEF_LIMIAR_AGRESSAO 0
+#define DEF_BRICK_EM_FORMACAO true
+
+enum ENUM_RENKO_CFGMODE
+{
+    RENKO_CFG_AUTO = 0,   // Automático: input alterado vale; o resto vem da última config do ativo
+    RENKO_CFG_INPUTS = 1, // Só os inputs (ignora a config salva e grava por cima)
+    RENKO_CFG_OFF = 2     // Desligado (não lê nem grava)
+};
+
 //+------------------------------------------------------------------+
 //| INPUTS DO USUÁRIO                                                |
 //+------------------------------------------------------------------+
-input int InpRenkoSizeTicks = 11;      // Tamanho da barra Renko (ticks)
-input int InpHistoryDays = 5;          // Dias de histórico a processar
-input int InpUpdateIntervalMs = 500;   // Intervalo de atualização (ms)
-input string InpTemplate = "";         // Template para o gráfico Renko
-input bool InpForceRebuild = true;     // Forçar reconstrução total do histórico
-input bool InpResetDiario = true;      // Reancorar a grade a cada dia novo [R4]
-input bool UsarLimiarAgressao = false; // Usar limiar de agressão para filtrar ticks
-input int LimiarAgressao = 0;          // Abaixo disto é considerado Agressão (0 desativa)
-input bool InpShowFormingBrick = true; // Desenhar o brick em formação como barra provisória [P1]
+input ENUM_RENKO_CFGMODE InpConfigModo = RENKO_CFG_AUTO; // Configuração por ativo (MQL5\Files\RenkoSynthetic) [G1]
+input int InpRenkoSizeTicks = DEF_RENKO_TICKS;      // Tamanho da barra Renko (ticks)
+input int InpHistoryDays = DEF_DIAS_HISTORICO;          // Dias de histórico a processar
+input int InpUpdateIntervalMs = DEF_INTERVALO_MS;   // Intervalo de atualização (ms)
+input string InpTemplate = DEF_TEMPLATE;         // Template para o gráfico Renko
+input bool InpForceRebuild = DEF_FORCAR_RECONSTRUCAO;     // Forçar reconstrução total do histórico
+input bool InpResetDiario = DEF_RESET_DIARIO;      // Reancorar a grade a cada dia novo [R4]
+input bool UsarLimiarAgressao = DEF_USAR_LIMIAR_AGRESSAO; // Usar limiar de agressão para filtrar ticks
+input int LimiarAgressao = DEF_LIMIAR_AGRESSAO;          // Abaixo disto é considerado Agressão (0 desativa)
+input bool InpShowFormingBrick = DEF_BRICK_EM_FORMACAO; // Desenhar o brick em formação como barra provisória [P1]
+
+//==================================================================//
+//                    CONFIGURAÇÃO POR ATIVO  [G1]                  //
+//==================================================================//
+//
+// O EA guarda a última configuração usada em cada ativo base em
+// MQL5\Files\RenkoSynthetic\<ativo>.cfg (texto CHAVE=valor) e a
+// reaplica quando é colocado de novo no mesmo ativo.
+//
+// Um EA não consegue alterar os próprios inputs, então o código usa
+// g_set (a configuração EFETIVA), nunca os inputs diretamente. No
+// modo Automático, para cada parâmetro:
+//   - input diferente do padrão compilado => o usuário mexeu: vale o
+//     input;
+//   - input no padrão => vale o valor salvo do ativo, se houver.
+// A configuração efetiva é regravada a cada início. Para voltar um
+// parâmetro ao padrão quando o salvo é outro, use o modo "Só os
+// inputs" uma vez. O log lista tudo o que veio do arquivo.
+//
+//==================================================================//
+
+struct RenkoSettings
+{
+    int renko_size_ticks;
+    int history_days;
+    int update_interval_ms;
+    string chart_template;
+    bool force_rebuild;
+    bool reset_diario;
+    bool usar_limiar_agressao;
+    int limiar_agressao;
+    bool show_forming_brick;
+};
+
+RenkoSettings g_set;        // configuração efetiva (inputs + .cfg do ativo)
+string g_cfg_keys[];        // conteúdo lido do .cfg
+string g_cfg_vals[];
+int g_cfg_from_file = 0;    // quantos parâmetros vieram do arquivo
+string g_cfg_path = "";
+
+string CfgFileName(const string base_symbol)
+{
+    string safe = base_symbol;
+    string bad = "\\/:*?\"<>|";
+    for (int i = 0; i < StringLen(bad); i++)
+        StringReplace(safe, StringSubstr(bad, i, 1), "_");
+    return "RenkoSynthetic\\" + safe + ".cfg";
+}
+
+void CfgRead(const string path)
+{
+    ArrayResize(g_cfg_keys, 0);
+    ArrayResize(g_cfg_vals, 0);
+    if (!FileIsExist(path))
+        return;
+    int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
+    if (h == INVALID_HANDLE)
+    {
+        Print("[CFG] Não foi possível ler ", path, " (erro ", GetLastError(), ").");
+        return;
+    }
+    while (!FileIsEnding(h))
+    {
+        string line = FileReadString(h);
+        int eq = StringFind(line, "=");
+        if (eq <= 0 || StringGetCharacter(line, 0) == '#')
+            continue;
+        int n = ArraySize(g_cfg_keys);
+        ArrayResize(g_cfg_keys, n + 1);
+        ArrayResize(g_cfg_vals, n + 1);
+        g_cfg_keys[n] = StringSubstr(line, 0, eq);
+        g_cfg_vals[n] = StringSubstr(line, eq + 1);
+    }
+    FileClose(h);
+}
+
+bool CfgFind(const string key, string &val)
+{
+    for (int i = 0; i < ArraySize(g_cfg_keys); i++)
+        if (g_cfg_keys[i] == key)
+        {
+            val = g_cfg_vals[i];
+            return true;
+        }
+    return false;
+}
+
+//--- valor efetivo de um parâmetro (como texto): ver regra no cabeçalho
+string CfgPick(const string key, const string input_val, const string def_val)
+{
+    if (InpConfigModo != RENKO_CFG_AUTO || input_val != def_val)
+        return input_val;
+    string saved = "";
+    if (!CfgFind(key, saved) || saved == input_val)
+        return input_val;
+    g_cfg_from_file++;
+    Print("[CFG]   ", key, " = ", saved, "  (salvo do ativo; input no padrão ", def_val, ")");
+    return saved;
+}
+
+string CfgB(const bool v) { return v ? "1" : "0"; }
+
+//+------------------------------------------------------------------+
+//| LoadSettings — monta g_set e regrava o .cfg do ativo             |
+//+------------------------------------------------------------------+
+void LoadSettings(const string base_symbol)
+{
+    g_cfg_from_file = 0;
+    g_cfg_path = CfgFileName(base_symbol);
+    ArrayResize(g_cfg_keys, 0);
+    ArrayResize(g_cfg_vals, 0);
+    if (InpConfigModo == RENKO_CFG_AUTO)
+        CfgRead(g_cfg_path);
+
+    g_set.renko_size_ticks = (int)StringToInteger(CfgPick("RENKO_TICKS", IntegerToString(InpRenkoSizeTicks), IntegerToString(DEF_RENKO_TICKS)));
+    g_set.history_days = (int)StringToInteger(CfgPick("DIAS_HISTORICO", IntegerToString(InpHistoryDays), IntegerToString(DEF_DIAS_HISTORICO)));
+    g_set.update_interval_ms = (int)StringToInteger(CfgPick("INTERVALO_MS", IntegerToString(InpUpdateIntervalMs), IntegerToString(DEF_INTERVALO_MS)));
+    g_set.chart_template = CfgPick("TEMPLATE", InpTemplate, DEF_TEMPLATE);
+    g_set.force_rebuild = (StringToInteger(CfgPick("FORCAR_RECONSTRUCAO", CfgB(InpForceRebuild), CfgB(DEF_FORCAR_RECONSTRUCAO))) != 0);
+    g_set.reset_diario = (StringToInteger(CfgPick("RESET_DIARIO", CfgB(InpResetDiario), CfgB(DEF_RESET_DIARIO))) != 0);
+    g_set.usar_limiar_agressao = (StringToInteger(CfgPick("USAR_LIMIAR_AGRESSAO", CfgB(UsarLimiarAgressao), CfgB(DEF_USAR_LIMIAR_AGRESSAO))) != 0);
+    g_set.limiar_agressao = (int)StringToInteger(CfgPick("LIMIAR_AGRESSAO", IntegerToString(LimiarAgressao), IntegerToString(DEF_LIMIAR_AGRESSAO)));
+    g_set.show_forming_brick = (StringToInteger(CfgPick("BRICK_EM_FORMACAO", CfgB(InpShowFormingBrick), CfgB(DEF_BRICK_EM_FORMACAO))) != 0);
+
+    //--- sanidade de valores vindos de um arquivo editado à mão
+    if (g_set.renko_size_ticks < 2)
+        g_set.renko_size_ticks = InpRenkoSizeTicks;
+    if (g_set.history_days < 1)
+        g_set.history_days = InpHistoryDays;
+    if (g_set.update_interval_ms < 50)
+        g_set.update_interval_ms = InpUpdateIntervalMs;
+
+    if (InpConfigModo == RENKO_CFG_OFF)
+    {
+        Print("[CFG] Configuração por ativo DESLIGADA: valem os inputs.");
+        return;
+    }
+    if (InpConfigModo == RENKO_CFG_INPUTS)
+        Print("[CFG] Modo \"Só os inputs\": a config salva foi ignorada e será regravada.");
+    else if (g_cfg_from_file > 0)
+        Print("[CFG] ", g_cfg_from_file, " parâmetro(s) vieram de ", g_cfg_path, " (lista acima).");
+    else
+        Print("[CFG] Nenhum parâmetro veio do arquivo: valem os inputs (", g_cfg_path, ").");
+    SaveSettings();
+}
+
+//--- grava a configuração efetiva (só reescreve o arquivo se mudou)
+void SaveSettings()
+{
+    if (MQLInfoInteger(MQL_TESTER))
+        return;
+    string k[], v[];
+    int n = 9;
+    ArrayResize(k, n);
+    ArrayResize(v, n);
+    k[0] = "RENKO_TICKS"; v[0] = IntegerToString(g_set.renko_size_ticks);
+    k[1] = "DIAS_HISTORICO"; v[1] = IntegerToString(g_set.history_days);
+    k[2] = "INTERVALO_MS"; v[2] = IntegerToString(g_set.update_interval_ms);
+    k[3] = "TEMPLATE"; v[3] = g_set.chart_template;
+    k[4] = "FORCAR_RECONSTRUCAO"; v[4] = CfgB(g_set.force_rebuild);
+    k[5] = "RESET_DIARIO"; v[5] = CfgB(g_set.reset_diario);
+    k[6] = "USAR_LIMIAR_AGRESSAO"; v[6] = CfgB(g_set.usar_limiar_agressao);
+    k[7] = "LIMIAR_AGRESSAO"; v[7] = IntegerToString(g_set.limiar_agressao);
+    k[8] = "BRICK_EM_FORMACAO"; v[8] = CfgB(g_set.show_forming_brick);
+
+    bool same = (ArraySize(g_cfg_keys) == n);
+    for (int i = 0; i < n && same; i++)
+    {
+        string cur = "";
+        same = (CfgFind(k[i], cur) && cur == v[i]);
+    }
+    if (same)
+        return;
+
+    FolderCreate("RenkoSynthetic");
+    int h = FileOpen(g_cfg_path, FILE_WRITE | FILE_TXT | FILE_ANSI);
+    if (h == INVALID_HANDLE)
+    {
+        Print("[CFG] Não foi possível gravar ", g_cfg_path, " (erro ", GetLastError(), ").");
+        return;
+    }
+    FileWriteString(h, "# RenkoSynthetic - ultima configuracao usada neste ativo\r\n");
+    for (int i = 0; i < n; i++)
+        FileWriteString(h, k[i] + "=" + v[i] + "\r\n");
+    FileClose(h);
+    Print("[CFG] Configuração gravada em ", g_cfg_path);
+}
 
 //+------------------------------------------------------------------+
 //| CONSTANTES E ENUMERAÇÕES                                         |
@@ -178,6 +407,7 @@ datetime g_first_commit = 0;  // 1ª barra real gravada no ciclo do timer
 
 #define OBJ_STATUS_TYPE "RenkoStatus_Type"
 #define OBJ_STATUS_INTEG "RenkoStatus_Integrity"
+#define OBJ_STATUS_CFG "RenkoStatus_Config"
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -185,10 +415,11 @@ datetime g_first_commit = 0;  // 1ª barra real gravada no ciclo do timer
 int OnInit()
 {
     g_ctx.base_symbol = Symbol();
+    LoadSettings(g_ctx.base_symbol); // [G1] daqui em diante o código usa g_set
     g_ctx.initialized = false;
     g_ctx.integrity_ok = false;
 
-    g_ctx.renko_symbol = g_ctx.base_symbol + "_" + IntegerToString(InpRenkoSizeTicks) + "_RE";
+    g_ctx.renko_symbol = g_ctx.base_symbol + "_" + IntegerToString(g_set.renko_size_ticks) + "_RE";
 
     GV_BAR_SIZE = g_ctx.renko_symbol + "_bar_size";
     GV_LAST_CLOSE_MS = g_ctx.renko_symbol + "_last_bar_close_ms"; // [C1]
@@ -212,10 +443,10 @@ int OnInit()
     ZeroMemory(g_prov_bar);
     g_prov_ts = GlobalVariableCheck(GV_PROV_TIME) ? (long)GlobalVariableGet(GV_PROV_TIME) : 0;
 
-    Print("=== RenkoSynthetic EA v3.11 iniciando ===");
+    Print("=== RenkoSynthetic EA v3.12 iniciando ===");
     Print("Símbolo base   : ", g_ctx.base_symbol);
     Print("Símbolo Renko  : ", g_ctx.renko_symbol);
-    Print("Tamanho Renko  : ", InpRenkoSizeTicks, " ticks");
+    Print("Tamanho Renko  : ", g_set.renko_size_ticks, " ticks");
 
     g_ctx.asset_type = DetectAssetType(g_ctx.base_symbol);
     g_ctx.flag_type = (g_ctx.asset_type == ASSET_FOREX) ? COPY_TICKS_INFO : COPY_TICKS_TRADE;
@@ -228,8 +459,8 @@ int OnInit()
     if (g_ctx.tick_size <= 0)
         g_ctx.tick_size = g_ctx.point_size; // fallback seguro
 
-    g_ctx.renko_size = InpRenkoSizeTicks * g_ctx.tick_size;            // 50 × 5 = 250
-    g_ctx.real_renko_size = (InpRenkoSizeTicks - 1) * g_ctx.tick_size; // 49 × 5 = 245
+    g_ctx.renko_size = g_set.renko_size_ticks * g_ctx.tick_size;            // 50 × 5 = 250
+    g_ctx.real_renko_size = (g_set.renko_size_ticks - 1) * g_ctx.tick_size; // 49 × 5 = 245
 
     g_ctx.real_renko_size =
         NormalizeDouble(g_ctx.real_renko_size, g_ctx.digits);
@@ -240,7 +471,7 @@ int OnInit()
     Print("Tick size      : ", g_ctx.tick_size);
     Print("Renko size     : ", DoubleToString(g_ctx.renko_size, g_ctx.digits));
     Print("Real renko size: ", DoubleToString(g_ctx.real_renko_size, g_ctx.digits));
-    Print("Corte de pregão: ", InpResetDiario
+    Print("Corte de pregão: ", g_set.reset_diario
               ? "a grade reancora a cada dia novo [R4]"
               : "nenhum — a grade e o brick em formação atravessam a noite");
 
@@ -258,7 +489,7 @@ int OnInit()
 
     LoadGlobalVars();
 
-    bool need_rebuild = InpForceRebuild;
+    bool need_rebuild = g_set.force_rebuild;
 
     if (!need_rebuild)
     {
@@ -294,7 +525,7 @@ int OnInit()
     RefreshProvisionalBar(); // [P1] só depois de o histórico estar íntegro
 
     DrawStatusText(g_ctx.integrity_ok);
-    EventSetMillisecondTimer(InpUpdateIntervalMs);
+    EventSetMillisecondTimer(g_set.update_interval_ms);
 
     g_ctx.initialized = true;
 
@@ -316,6 +547,7 @@ void OnDeinit(const int reason)
     RemoveProvisionalBar(); // [P1] deixa o gráfico só com barras fechadas
     ObjectDelete(0, OBJ_STATUS_TYPE);
     ObjectDelete(0, OBJ_STATUS_INTEG);
+    ObjectDelete(0, OBJ_STATUS_CFG);
     Print("RenkoSynthetic EA encerrado. Motivo: ", reason);
 }
 
@@ -436,7 +668,7 @@ void CopySymbolProperties()
     CustomSymbolSetDouble(rsym, SYMBOL_POINT, SymbolInfoDouble(sym, SYMBOL_POINT));
 
     string desc = SymbolInfoString(sym, SYMBOL_DESCRIPTION);
-    CustomSymbolSetString(rsym, SYMBOL_DESCRIPTION, desc + " [Renko " + IntegerToString(InpRenkoSizeTicks) + "]");
+    CustomSymbolSetString(rsym, SYMBOL_DESCRIPTION, desc + " [Renko " + IntegerToString(g_set.renko_size_ticks) + "]");
     CustomSymbolSetString(rsym, SYMBOL_CURRENCY_BASE, SymbolInfoString(sym, SYMBOL_CURRENCY_BASE));
     CustomSymbolSetString(rsym, SYMBOL_CURRENCY_PROFIT, SymbolInfoString(sym, SYMBOL_CURRENCY_PROFIT));
     CustomSymbolSetInteger(rsym, SYMBOL_TRADE_CALC_MODE, SymbolInfoInteger(sym, SYMBOL_TRADE_CALC_MODE));
@@ -493,7 +725,7 @@ void RemoveProvisionalBar()
 //+------------------------------------------------------------------+
 void RefreshProvisionalBar()
 {
-    if (!InpShowFormingBrick || g_ctx.last_close <= 0 || g_next_bar_time <= 0)
+    if (!g_set.show_forming_brick || g_ctx.last_close <= 0 || g_next_bar_time <= 0)
     {
         RemoveProvisionalBar();
         return;
@@ -720,7 +952,7 @@ bool CheckHistoryIntegrity()
         //--- entre o último brick de um dia e o primeiro do seguinte é
         //--- legítima. Sem esta exceção o corte diário forçaria
         //--- reconstrução total a cada restart do EA.
-        bool virou_dia = (InpResetDiario &&
+        bool virou_dia = (g_set.reset_diario &&
                           DiaDoTick((long)rates[i].time * 1000) !=
                               DiaDoTick((long)rates[i + 1].time * 1000));
 
@@ -765,12 +997,12 @@ bool RebuildHistory()
 {
     Print("Iniciando reconstrução do histórico Renko...");
 
-    datetime date_from = TimeCurrent() - (datetime)(InpHistoryDays * 86400);
+    datetime date_from = TimeCurrent() - (datetime)(g_set.history_days * 86400);
 
     //--- [R4] começa a varredura na virada de dia: com a grade
     //--- reancorando por pregão, um primeiro dia truncado reancoraria
     //--- num preço do meio da sessão. Custo: até um dia a mais de ticks.
-    if (InpResetDiario)
+    if (g_set.reset_diario)
         date_from = (datetime)(((long)date_from / 86400) * 86400);
     datetime date_to = TimeCurrent();
 
@@ -780,15 +1012,6 @@ bool RebuildHistory()
 
     Print(" from: ", TimeToString(date_from, TIME_DATE | TIME_SECONDS),
           " | to: ", TimeToString(date_to, TIME_DATE | TIME_SECONDS));
-
-    int tick_count = CopyTicksRange(g_ctx.base_symbol, ticks, g_ctx.flag_type, from_ms, to_ms);
-    if (tick_count <= 0)
-    {
-        Print("ERRO: Nenhum tick obtido para reconstrução. Código: ", GetLastError());
-        return false;
-    }
-
-    Print("Ticks obtidos para reconstrução: ", tick_count);
 
     // Zera estado completo
     g_ctx.last_close = 0;
@@ -802,9 +1025,60 @@ bool RebuildHistory()
     g_prev_ask = 0;
     ZeroMemory(g_ctx.current_bar);
 
+    // [M1] Um dia de ticks por vez, em vez dos InpHistoryDays de uma só
+    // vez: o pico de memória cai para o de um único pregão. O resultado
+    // é o mesmo — os ticks passam pelo mesmo ProcessTick na mesma ordem.
+    // Cada pedaço vai até a virada do dia INCLUSIVE e o seguinte começa
+    // nela: um tick exatamente na fronteira pode vir duas vezes, e o
+    // filtro last_seen_ms [C1] descarta a repetição.
+    const ulong DAY_MS = 86400000;
+    long tick_total = 0;
     int bars_created = 0;
-    for (int i = 0; i < tick_count; i++)
-        ProcessTick(ticks[i], bars_created);
+    int chunks_failed = 0;
+    int last_error = 0;
+
+    ulong chunk_from = from_ms;
+    while (chunk_from < to_ms)
+    {
+        ulong chunk_to = (chunk_from / DAY_MS + 1) * DAY_MS;
+        if (chunk_to > to_ms)
+            chunk_to = to_ms;
+
+        ResetLastError();
+        int n = CopyTicksRange(g_ctx.base_symbol, ticks, g_ctx.flag_type, chunk_from, chunk_to);
+        if (n < 0)
+        {
+            // uma segunda tentativa: o histórico de ticks pode estar sincronizando
+            ResetLastError();
+            n = CopyTicksRange(g_ctx.base_symbol, ticks, g_ctx.flag_type, chunk_from, chunk_to);
+        }
+        if (n < 0)
+        {
+            last_error = GetLastError();
+            chunks_failed++;
+            Print("AVISO: falha ao ler os ticks de ",
+                  TimeToString((datetime)(chunk_from / 1000), TIME_DATE),
+                  " (código ", last_error, "). O dia ficou fora da reconstrução.");
+        }
+        else
+        {
+            for (int i = 0; i < n; i++)
+                ProcessTick(ticks[i], bars_created);
+            tick_total += n;
+        }
+
+        chunk_from = chunk_to;
+    }
+    ArrayFree(ticks);
+
+    if (tick_total <= 0)
+    {
+        Print("ERRO: Nenhum tick obtido para reconstrução. Código: ", last_error);
+        return false;
+    }
+
+    Print("Ticks obtidos para reconstrução: ", tick_total,
+          (chunks_failed > 0 ? " — ATENÇÃO: " + IntegerToString(chunks_failed) + " dia(s) com falha de leitura" : ""));
 
     SaveGlobalVars();
     Print("Reconstrução concluída. Barras Renko geradas: ", bars_created);
@@ -818,20 +1092,26 @@ bool RebuildHistory()
 //+------------------------------------------------------------------+
 //| UpdateRenkoIncremental                                           |
 //|                                                                  |
-//| [C1] from_ms usa last_bar_close_ms — âncora no fechamento da    |
-//|      última barra, não no último tick visto.                     |
+//| [M2] from_ms usa last_seen_ms (nunca antes de last_bar_close_ms):|
+//|      o filtro [C1] já descartava o que vinha antes, então o      |
+//|      resultado é o mesmo e o ciclo copia muito menos ticks.      |
 //|                                                                  |
 //| [C4] Ponto único de saída: SaveGlobalVars é sempre chamado,     |
 //|      independente de barras terem sido criadas ou não.           |
 //+------------------------------------------------------------------+
 void UpdateRenkoIncremental()
 {
-    // [C1] Busca ticks desde o fechamento da última barra.
-    // Ticks já processados (between last_bar_close_ms e last_seen_ms)
-    // serão re-entregues mas descartados dentro de ProcessTick pelo
-    // filtro last_seen_ms.
-    ulong from_ms = (g_ctx.last_bar_close_ms > 0)
-                        ? (ulong)(g_ctx.last_bar_close_ms) // inclui o tick de fechamento
+    // [M2] Busca ticks a partir do ÚLTIMO TICK VISTO (inclusive), não
+    // mais do fechamento da última barra. ProcessTick já descartava
+    // tudo com time_msc <= last_seen_ms [C1], então o que chega a ser
+    // processado é idêntico — só deixa de copiar e percorrer, a cada
+    // ciclo, todos os ticks do brick em formação. Sem tick visto
+    // ainda, vale a âncora antiga.
+    long anchor_ms = g_ctx.last_seen_ms;
+    if (anchor_ms < g_ctx.last_bar_close_ms)
+        anchor_ms = g_ctx.last_bar_close_ms; // nunca antes do fechamento
+    ulong from_ms = (anchor_ms > 0)
+                        ? (ulong)(anchor_ms)
                         : (ulong)((TimeCurrent() - 86400) * 1000);
     ulong to_ms = (ulong)TimeCurrent() * 1000 + 1000;
 
@@ -939,9 +1219,9 @@ void EstimateAggression(const MqlTick &tick, long &buy_vol, long &sell_vol)
     if (g_ctx.asset_type == ASSET_EXCHANGE)
     {
         bool condicaoLimiar = true;
-        if (UsarLimiarAgressao)
+        if (g_set.usar_limiar_agressao)
         {
-            condicaoLimiar = vol < LimiarAgressao;
+            condicaoLimiar = vol < g_set.limiar_agressao;
         }
 
         bool is_buy = ((tick.flags & TICK_FLAG_BUY) == TICK_FLAG_BUY) && (condicaoLimiar);
@@ -1054,7 +1334,7 @@ void ProcessTick(const MqlTick &tick, int &bars_created)
     // [R4] Virada de pregão: o brick em formação não atravessa a noite
     // e a grade reancora no primeiro preço do dia novo.
     // ------------------------------------------------------------------
-    if (InpResetDiario && g_ctx.last_seen_ms > 0 &&
+    if (g_set.reset_diario && g_ctx.last_seen_ms > 0 &&
         DiaDoTick(tick_ms) != DiaDoTick(g_ctx.last_seen_ms))
         ResetDia();
 
@@ -1311,8 +1591,8 @@ void TryOpenRenkoChart()
     if (new_chart > 0)
     {
         ChartSetInteger(new_chart, CHART_AUTOSCROLL, true);
-        if (InpTemplate != "")
-            ChartApplyTemplate(new_chart, InpTemplate);
+        if (g_set.chart_template != "")
+            ChartApplyTemplate(new_chart, g_set.chart_template);
         Print("Gráfico Renko aberto: ", g_ctx.renko_symbol);
     }
 }
@@ -1349,6 +1629,27 @@ void DrawStatusText(bool integrity_ok)
     ObjectSetInteger(0, OBJ_STATUS_INTEG, OBJPROP_FONTSIZE, 18);
     ObjectSetInteger(0, OBJ_STATUS_INTEG, OBJPROP_COLOR, integrity_ok ? clrLime : clrRed);
     ObjectSetInteger(0, OBJ_STATUS_INTEG, OBJPROP_SELECTABLE, false);
+
+    // [G1] a janela de inputs não mostra o que veio do arquivo: avisa aqui
+    string cfg_text = StringFormat("RENKO %d ticks", g_set.renko_size_ticks);
+    if (InpConfigModo == RENKO_CFG_OFF)
+        cfg_text += " | config por ativo: desligada";
+    else if (g_cfg_from_file > 0)
+        cfg_text += StringFormat(" | %d parâmetro(s) da config salva do ativo (ver log)", g_cfg_from_file);
+    else
+        cfg_text += " | config: inputs";
+
+    if (ObjectFind(0, OBJ_STATUS_CFG) < 0)
+        ObjectCreate(0, OBJ_STATUS_CFG, OBJ_LABEL, 0, 0, 0);
+
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_XDISTANCE, 10);
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_YDISTANCE, 100);
+    ObjectSetString(0, OBJ_STATUS_CFG, OBJPROP_TEXT, cfg_text);
+    ObjectSetString(0, OBJ_STATUS_CFG, OBJPROP_FONT, "Arial");
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_FONTSIZE, 10);
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_COLOR, (g_cfg_from_file > 0) ? clrOrange : clrGray);
+    ObjectSetInteger(0, OBJ_STATUS_CFG, OBJPROP_SELECTABLE, false);
 
     ChartRedraw(0);
 }

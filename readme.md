@@ -1,10 +1,10 @@
-# 💹 RenkoSynthetic EA (v3.11)
+# 💹 RenkoSynthetic EA (v3.12)
 
 **Expert Advisor para MetaTrader 5 (MQL5) para geração de gráficos Renko, publicados em ativos sintéticos, para ativos BOLSA e FOREX**
 
 ![MQL5](https://img.shields.io/badge/Language-MQL5-blue.svg)
 ![Status](https://img.shields.io/badge/Status-Stable-green.svg)
-![Version](https://img.shields.io/badge/Version-3.11-orange.svg)
+![Version](https://img.shields.io/badge/Version-3.12-orange.svg)
 
 ---
 
@@ -31,7 +31,13 @@ Essa adaptação permite embutir informações de microestrutura diretamente nas
 
 ---
 
-## 🚀 Principais Novidades (v3.11)
+## 🚀 Principais Novidades (v3.12)
+
+- **[G1] Configuração por ativo:** a última configuração usada em cada ativo base é gravada em `MQL5\Files\RenkoSynthetic\<ativo>.cfg` e reaplicada quando o EA volta a ser colocado no mesmo ativo. Detalhes na seção [Configuração por ativo](#-configuração-por-ativo).
+- **[M1] Reconstrução com menos memória:** o histórico é lido um dia de ticks por vez, em vez de todos os `InpHistoryDays` de uma só vez. O pico de memória passa a ser o de um único pregão; os ticks passam pelo mesmo processamento, na mesma ordem. Se a leitura de um dia falhar, o EA tenta de novo, avisa no log e segue com os demais dias (só aborta se nenhum tick for obtido).
+- **[M2] Atualização incremental mais leve:** a cada ciclo do timer a busca de ticks começa no último tick já visto (`last_seen_ms`), e não mais no fechamento da última barra. O filtro [C1] já descartava o que vinha antes, então o gráfico gerado é o mesmo — o EA só deixa de copiar e percorrer, duas vezes por segundo, todos os ticks do tijolo em formação.
+
+### v3.11
 
 - **[R4] Corte de pregão:** na virada do dia (hora do servidor, tirada do timestamp do tick) o tijolo em formação é descartado e a grade reancora no primeiro preço do dia novo. O gap noturno deixa de ficar escondido dentro de um tijolo e a sequência de um pregão não se mistura com a do seguinte. A verificação de integridade aceita a descontinuidade de preço na virada de dia, e a reconstrução começa no início de um dia. Com `InpResetDiario = false` o gráfico é idêntico ao da v3.08.
 - **[P1] Tijolo em formação no gráfico:** o tijolo que ainda não fechou é desenhado como uma barra provisória no próprio símbolo sintético, com o estilo de candle do gráfico e a agressão acumulada até o momento. Ela não consome timestamp nem altera o estado do gerador, é apagada antes de toda verificação de integridade e ao remover o EA, e um restart do terminal sabe apagar a provisória deixada pela sessão anterior. Desligável com `InpShowFormingBrick = false`.
@@ -57,6 +63,7 @@ O EA permite ajustes finos para se adaptar a diferentes volatilidades e necessid
 
 | Parâmetro             | Descrição                                                         |
 | :-------------------- | :---------------------------------------------------------------- |
+| `InpConfigModo`       | Configuração por ativo: Automático, Só os inputs ou Desligado [G1]. |
 | `InpRenkoSizeTicks`   | Tamanho de cada tijolo Renko em ticks.                            |
 | `InpHistoryDays`      | Quantidade de dias para processar na reconstrução inicial.        |
 | `InpUpdateIntervalMs` | Frequência de atualização do gráfico em milissegundos.            |
@@ -69,6 +76,33 @@ O EA permite ajustes finos para se adaptar a diferentes volatilidades e necessid
 
 > **Print das Configurações:**  
 > ![Configurações de Usuário](img/param.png)
+>
+> *O print é anterior à v3.12 e ainda não mostra o parâmetro `InpConfigModo`.*
+
+---
+
+## 💾 Configuração por ativo
+
+A partir da v3.12 o EA lembra a última configuração usada em cada ativo. Ao iniciar, ele grava todos os parâmetros da tabela acima em `MQL5\Files\RenkoSynthetic\<ativo>.cfg` (texto `CHAVE=valor`, um arquivo por símbolo base) e os reaplica na próxima vez que for colocado no mesmo ativo.
+
+Um EA não consegue alterar os próprios inputs, então a janela de inputs (F7) continua mostrando os valores padrão. No modo **Automático**, a regra para cada parâmetro é:
+
+- **input diferente do padrão** → você mexeu nele: vale o input, e ele passa a ser o valor salvo;
+- **input no padrão** → vale o valor salvo do ativo, se houver.
+
+Para saber o que está valendo, o EA escreve no log uma linha por parâmetro vindo do arquivo e mostra no gráfico base uma linha de status, por exemplo `RENKO 15 ticks | 3 parâmetro(s) da config salva do ativo (ver log)`.
+
+| Modo (`InpConfigModo`) | Comportamento                                                        |
+| :--------------------- | :------------------------------------------------------------------- |
+| Automático (padrão)    | A regra acima.                                                       |
+| Só os inputs           | Ignora o arquivo, usa exatamente os inputs e grava por cima.         |
+| Desligado              | Não lê nem grava nada.                                               |
+
+**Pontos de atenção:**
+
+- **Voltar um parâmetro ao padrão:** se o valor salvo é 15 ticks e você quer o padrão 11, deixar 11 no input não basta — o EA não distingue "deixei no padrão" de "escolhi o padrão". Use o modo *Só os inputs* uma vez.
+- **Dois Renkos no mesmo ativo:** o arquivo é um por ativo base. Com dois gráficos do mesmo ativo em tamanhos diferentes, o que estiver no padrão assumiria o tamanho salvo pelo outro na próxima reinicialização. Nesse caso use *Só os inputs* ou *Desligado* em ambos.
+- **Troca de vencimento:** o arquivo usa o nome exato do símbolo; um contrato novo começa nos padrões.
 
 ---
 
@@ -80,6 +114,7 @@ O EA permite ajustes finos para se adaptar a diferentes volatilidades e necessid
   - **Forex:** Baseado na variação do *Mid-Price* entre ticks.
 - **Relógio de Timestamps:** Garante que cada barra tenha um timestamp estritamente crescente, essencial para a plotagem correta no MT5.
 - **Gestão de Símbolos:** Cria automaticamente o símbolo com o sufixo `_RE` na pasta `Custom\Renko`.
+- **Leitura de ticks:** a reconstrução lê um dia por vez [M1] e a atualização ao vivo busca apenas os ticks posteriores ao último já visto [M2].
 
 ---
 
@@ -87,12 +122,14 @@ O EA permite ajustes finos para se adaptar a diferentes volatilidades e necessid
 
 O código está organizado em blocos modulares para facilitar a manutenção:
 
-1. **Persistência:** `SaveGlobalVars` e `LoadGlobalVars`
-2. **Integridade:** `CheckHistoryIntegrity` valida gaps de preço e timestamps
-3. **Processamento:** `ProcessTick` gerencia o loop principal de criação de barras
-4. **Corte de pregão:** `DiaDoTick` e `ResetDia` reancoram a grade na virada do dia
-5. **Barra provisória:** `RefreshProvisionalBar` e `RemoveProvisionalBar` desenham e apagam o tijolo em formação
-6. **Interface:** `DrawStatusText` exibe o status de integridade diretamente no gráfico
+1. **Configuração por ativo:** `LoadSettings` e `SaveSettings` montam a configuração efetiva (`g_set`) e gravam o `.cfg`
+2. **Persistência de estado:** `SaveGlobalVars` e `LoadGlobalVars`
+3. **Integridade:** `CheckHistoryIntegrity` valida gaps de preço e timestamps
+4. **Histórico:** `RebuildHistory` reconstrói o gráfico dia a dia; `UpdateRenkoIncremental` atualiza ao vivo
+5. **Processamento:** `ProcessTick` gerencia o loop principal de criação de barras
+6. **Corte de pregão:** `DiaDoTick` e `ResetDia` reancoram a grade na virada do dia
+7. **Barra provisória:** `RefreshProvisionalBar` e `RemoveProvisionalBar` desenham e apagam o tijolo em formação
+8. **Interface:** `DrawStatusText` exibe o tipo de ativo, a integridade e a origem da configuração no gráfico
 
 ---
 
@@ -103,4 +140,4 @@ O código está organizado em blocos modulares para facilitar a manutenção:
 
 ---
 
-*Este README foi gerado com base na análise técnica do código fonte RenkoSynthetic.mq5 v3.11.*
+*Este README foi gerado com base na análise técnica do código fonte RenkoSynthetic.mq5 v3.12.*
